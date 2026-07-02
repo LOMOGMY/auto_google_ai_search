@@ -19,7 +19,7 @@
 | 完整引用 URL 还原 | 前 3 个稳定 anchor + favicon 反查，实测最多 22 个引用源全部还原 |
 | 跨平台 | Windows / macOS / Linux 同名命令；中文查询 stdin 输入避开编码问题 |
 | 自清理 | 后台 tab 用完自动关闭，不影响用户当前浏览器页面 |
-| 智能查询拆分 | 由 Agent 按"主题 vs 具体查询"判断是否拆分为多个并行查询 |
+| 默认串行 + 支持并行 | 单查询串行执行；用户说"同时"/"并行"或多并列查询时并行派发（上限 5 个，避免开太多 tab 卡顿） |
 | 30 秒接入 | git clone + 一行 check-deps 即可使用，不需要任何配置文件 |
 
 ---
@@ -115,6 +115,30 @@ skill 加载后，Agent 看到以下提示会自动触发：
 
 Agent 拿到 JSON 后，会自动把 AI 回答和引用源整理成结构化表格返回。
 
+### 多查询并行（默认串行，可选并行）
+
+**默认**：单查询串行调用一次 `run_search.mjs`。
+
+**触发并行**（任一满足时）：
+
+- 用户明确说"同时"/"并行"/"一起"/"分别"——例如："**同时**打开两个页面并行搜索"
+- 用户给了多个并列的具体查询——例如："搜一下 1 型糖尿病治疗方案 和 2 型糖尿病治疗方案"
+- 简单对比场景——例如："X 和 Y 的区别"、"X vs Y"
+- 主题类输入——例如："糖尿病防治"（先拆为 3-5 个具体查询再并行）
+
+**并行上限 5**：同时执行的任务数 ≤ 5。
+
+**两种实现方式**：
+
+| 场景 | 推荐方式 |
+|------|---------|
+| 任意数量（含 > 5） | **`run_parallel.mjs`**：调一次，内部动态池调度（work-stealing），任一完成立刻补位 |
+| ≤ 5 个查询且需要子 Agent 各自处理 | web-access 子 Agent 分治：主 Agent 派 N 个子 Agent |
+
+> 实测 8 查询示例：`run_parallel.mjs` 动态池比"分批（5+3 串行）"快约 14%。
+
+详见 [SKILL.md 并行章节](./SKILL.md#执行模式默认串行支持并行上限-5)。
+
 ### 直接命令行调用
 
 ```bash
@@ -134,6 +158,15 @@ echo "atezolizumab immune checkpoint inhibitor adverse effects" \
 # 5) 仅生成 AI 模式 URL，不调用浏览器
 node scripts/build_url.mjs "vitamin D deficiency"
 # → https://www.google.com/search?udm=50&q=vitamin%20D%20deficiency
+
+# 6) 多查询并发（动态池调度，上限 5）
+node scripts/run_parallel.mjs "metformin side effects" "lisinopril side effects" "amlodipine side effects"
+
+# 7) 多查询并发，从文件读（每行一个）
+node scripts/run_parallel.mjs -f queries.txt
+
+# 8) 多查询并发 + 自定义并发上限
+node scripts/run_parallel.mjs -c 3 -f queries.txt
 ```
 
 ### 命令行参数
@@ -146,6 +179,21 @@ node scripts/build_url.mjs "vitamin D deficiency"
 | `--max-wait <sec>` | 30 | AI 回答渲染最长等待秒数 |
 | `--keep-tab` | false | 不关闭自创建的 tab（调试用） |
 | `--proxy <url>` | `http://127.0.0.1:3456` | CDP Proxy 地址 |
+
+### run_parallel.mjs 专属参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `<query>...` (位置参数，N 个) | — | 直接传多个查询 |
+| `-f <file>` / `--file <file>` | — | 从文件读查询（每行一个） |
+| (stdin) | — | 无参数且 stdin 非 TTY 时从 stdin 读 |
+| `-c <n>` / `--concurrency <n>` | 5 | 最大并发数 |
+| `--max-wait <sec>` | 30 | 透传给每个 run_search.mjs 子进程 |
+| `--proxy <url>` | `http://127.0.0.1:3456` | CDP Proxy 地址 |
+
+**输出**：合并 JSON 数组（按原始查询顺序），每个结果含 `status`（fulfilled / rejected）、`duration_seconds`、`result`（run_search.mjs 的输出）。
+
+**退出码**：0 = 全部成功；1 = 有失败；2 = 使用错误。
 
 ---
 
@@ -212,6 +260,8 @@ node scripts/build_url.mjs "vitamin D deficiency"
 | `ready: false` 或 wait 拉满 | AI 回答 30 秒内未渲染完成 | 加 `--max-wait 60` |
 | references 只有 3 个 | 展开按钮未生效或页面结构变化 | 加 `--keep-tab` 调试，检查 DOM |
 | 登录墙提示 | 用户 Chrome 未登录 Google | 告诉用户"请登录 Google 账号后重试" |
+| `run_parallel.mjs` Chrome 卡顿 | 并发过高，单 tab 内存 100-200MB | 减 `-c` 到 3 或更少 |
+| `run_parallel.mjs` 部分查询 status=rejected | 单个 run_search.mjs 失败 | 看 stderr 的 worker 日志定位具体查询 |
 
 详细故障排查见 [SKILL.md 故障排查清单](./SKILL.md#故障排查清单)。
 
@@ -225,7 +275,8 @@ node scripts/build_url.mjs "vitamin D deficiency"
 ├── README.md             # 本文件：用户视角快速入门
 └── scripts/
     ├── build_url.mjs     # 轻量工具：query → AI 模式 URL（不调浏览器）
-    ├── run_search.mjs    # 端到端主脚本：搜索 + 抓取 + 输出 JSON
+    ├── run_search.mjs    # 端到端主脚本：单查询搜索 + 抓取 + 输出 JSON
+    ├── run_parallel.mjs  # 多查询并发（动态池调度，上限 5，推荐用于 N≥2）
     └── extract_refs.js   # 浏览器内引用的提取逻辑（被 run_search.mjs 调用）
 ```
 
